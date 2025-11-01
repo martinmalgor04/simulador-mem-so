@@ -1,0 +1,15 @@
+# Archivo de procesos para el simulador
+# Formato: ID_Proceso,Tamaño_KB,Tiempo_Arribo,Tiempo_Irrupción FALTA TITULO
+# Ejemplo de procesos para demostrar el funcionamiento del simulador
+
+1,40,0,8
+2,180,1,6
+3,60,2,4
+4,200,3,10
+5,30,4,3
+6,120,5,7
+7,45,6,5
+8,160,7,9
+9,25,8,2
+10,90,9,6
+
