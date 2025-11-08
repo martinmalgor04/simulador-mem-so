@@ -242,7 +242,7 @@ class SimuladorSO:
         Calcula el grado de multiprogramación actual
         Grado = Procesos en RAM + Procesos suspendidos
         - RAM: máximo 3 procesos (hay 3 particiones disponibles, excluyendo SO)
-        - Suspendidos: máximo 2 procesos
+        - Suspendidos: máximo 2 procesos, pueden haber mas en casos especiales.
         - Total: máximo 5 procesos
         """
         # Procesos en RAM (excluyendo SO que siempre está)
@@ -423,14 +423,18 @@ class SimuladorSO:
         """
         Procesa los procesos que llegan en el tiempo actual
         Los procesos están en procesos_nuevos ordenados por tiempo_arribo
+        Retorna True si hubo procesos que arribaron
         """
+        procesos_arribados = []
         # Procesar procesos que acaban de arribar (tiempo_arribo <= tiempo_actual)
         for proceso in self.procesos_nuevos[:]:
             if proceso.tiempo_arribo <= self.tiempo_actual:
                 # Remover de nuevos y intentar admitir
                 self.procesos_nuevos.remove(proceso)
+                procesos_arribados.append(proceso)
                 # Intentar admitir (si no se puede, vuelve a procesos_nuevos)
                 self.intentar_admitir_proceso(proceso)
+        return len(procesos_arribados) > 0
     
     def buscar_proceso_suspendido_mas_corto(self, proceso_actual: Optional[Proceso]) -> Optional[Proceso]:
         """Busca el proceso suspendido con menor tiempo restante"""
@@ -525,43 +529,55 @@ class SimuladorSO:
         # Sacar suspendido de la lista y ponerlo en ejecución
         self.procesos_suspendidos.remove(proceso_suspendido)
         proceso_suspendido.estado = EstadoProceso.EJECUCION
+        # Establecer tiempo_inicio si es la primera vez que se ejecuta
+        if proceso_suspendido.tiempo_inicio is None:
+            proceso_suspendido.tiempo_inicio = self.tiempo_actual
         self.planificador.proceso_actual = proceso_suspendido
         
         return True
     
     def ejecutar_ciclo(self) -> Dict:
         """
-        Ejecuta un ciclo de simulación
+        Ejecuta un ciclo de simulación en el tiempo actual
         Retorna diccionario con información de cambios para mostrar
         """
         cambios = {
             'proceso_terminado': None,
             'proceso_swapeado': False,
-            'cambio_multiprogramacion': False
+            'cambio_multiprogramacion': False,
+            'proceso_arribado': False,
+            'hay_cambios': False
         }
         
-        # Ejecutar proceso actual si existe (excluyendo SO)
-        if self.planificador.proceso_actual and self.planificador.proceso_actual.id != 1:
-            self.planificador.ejecutar_proceso(self.planificador.proceso_actual, self.tiempo_actual)
+        # Verificar si el proceso actual terminó (tiempo_restante llegó a 0)
+        # El tiempo_restante ya fue actualizado en ejecutar_simulacion antes de llamar a ejecutar_ciclo
+        if (self.planificador.proceso_actual and 
+            self.planificador.proceso_actual.id != 1 and
+            self.planificador.proceso_actual.tiempo_restante <= 0):
+            proceso_terminado = self.planificador.proceso_actual
+            proceso_terminado.estado = EstadoProceso.TERMINADO
+            # tiempo_finalizacion ya fue establecido en ejecutar_simulacion
+            self.procesos_terminados.append(proceso_terminado)
+            self.gestor_memoria.liberar_memoria(proceso_terminado.id)
+            self.planificador.proceso_actual = None
+            cambios['proceso_terminado'] = proceso_terminado
+            cambios['hay_cambios'] = True
             
-            # Verificar si terminó
-            if self.planificador.proceso_actual.estado == EstadoProceso.TERMINADO:
-                proceso_terminado = self.planificador.proceso_actual
-                self.procesos_terminados.append(proceso_terminado)
-                self.gestor_memoria.liberar_memoria(proceso_terminado.id)
-                self.planificador.proceso_actual = None
-                cambios['proceso_terminado'] = proceso_terminado
-                
-                # Intentar admitir procesos: primero suspendidos, luego nuevos
-                self.intentar_admitir_suspendidos()
-                self.intentar_admitir_procesos_nuevos()
+            # Intentar admitir procesos: primero suspendidos, luego nuevos
+            if self.intentar_admitir_suspendidos():
+                cambios['hay_cambios'] = True
+            if self.intentar_admitir_procesos_nuevos():
+                cambios['hay_cambios'] = True
         
         # Verificar swap SRTF con suspendidos (antes de procesar arribos)
         if self.intentar_swap_srtf():
             cambios['proceso_swapeado'] = True
+            cambios['hay_cambios'] = True
         
         # Procesar arribos
-        self.procesar_arribos()
+        if self.procesar_arribos():
+            cambios['proceso_arribado'] = True
+            cambios['hay_cambios'] = True
         
         # Verificar apropiación SRTF de nuevos procesos
         if self.planificador.proceso_actual:
@@ -579,20 +595,31 @@ class SimuladorSO:
                     # Reconstruir heap
                     heapq.heapify(self.planificador.cola_listos)
                     proceso_mas_corto_cola.estado = EstadoProceso.EJECUCION
+                    # Establecer tiempo_inicio si es la primera vez que se ejecuta
+                    if proceso_mas_corto_cola.tiempo_inicio is None:
+                        proceso_mas_corto_cola.tiempo_inicio = self.tiempo_actual
                     self.planificador.proceso_actual = proceso_mas_corto_cola
                     cambios['proceso_swapeado'] = True
+                    cambios['hay_cambios'] = True
         
         # Si no hay proceso ejecutándose, tomar el siguiente (excluyendo SO)
-        if not self.planificador.proceso_actual:
+        proceso_anterior = self.planificador.proceso_actual.id if self.planificador.proceso_actual else None
+        if not self.planificador.proceso_actual or (self.planificador.proceso_actual and self.planificador.proceso_actual.id == 1):
             siguiente = self.planificador.obtener_siguiente_proceso()
             if siguiente and siguiente.id != 1:
                 siguiente.estado = EstadoProceso.EJECUCION
+                # Establecer tiempo_inicio si no está establecido
+                if siguiente.tiempo_inicio is None:
+                    siguiente.tiempo_inicio = self.tiempo_actual
                 self.planificador.proceso_actual = siguiente
+                if proceso_anterior != siguiente.id:
+                    cambios['hay_cambios'] = True
         
         # Verificar cambios en grado de multiprogramación
         grado_actual = self.calcular_grado_multiprogramacion()
         if grado_actual != self.estado_previo['grado_multiprogramacion']:
             cambios['cambio_multiprogramacion'] = True
+            cambios['hay_cambios'] = True
         
         return cambios
     
@@ -649,6 +676,41 @@ class SimuladorSO:
     def hay_cambios_significativos(self, cambios: Dict) -> bool:
         """Determina si hay cambios significativos que justifiquen mostrar el estado"""
         return True
+    
+    def calcular_tiempo_proximo_evento(self) -> int:
+        """
+        Calcula el tiempo del próximo evento significativo.
+        Retorna el próximo tiempo donde ocurrirá un cambio de contexto.
+        """
+        tiempos_eventos = []
+        
+        # 1. Próximo arribo de proceso
+        if self.procesos_nuevos:
+            proximo_arribo = min(p.tiempo_arribo for p in self.procesos_nuevos)
+            if proximo_arribo > self.tiempo_actual:
+                tiempos_eventos.append(proximo_arribo)
+        
+        # 2. Próxima finalización de proceso (si hay uno en ejecución y no es SO)
+        if (self.planificador.proceso_actual and 
+            self.planificador.proceso_actual.id != 1 and
+            self.planificador.proceso_actual.estado == EstadoProceso.EJECUCION and
+            self.planificador.proceso_actual.tiempo_restante > 0):
+            tiempo_finalizacion = self.tiempo_actual + self.planificador.proceso_actual.tiempo_restante
+            tiempos_eventos.append(tiempo_finalizacion)
+        
+        # Si no hay eventos futuros pero hay procesos esperando, retornar tiempo_actual + 1
+        if not tiempos_eventos:
+            # Si hay proceso en ejecución, debería haber un tiempo de finalización
+            # Si no hay, puede ser que no haya procesos o que estén todos suspendidos
+            if (self.planificador.proceso_actual or 
+                self.planificador.cola_listos or 
+                self.procesos_suspendidos):
+                return self.tiempo_actual + 1
+            else:
+                return self.tiempo_actual
+        
+        # Retornar el evento más cercano
+        return min(tiempos_eventos)
     
     def mostrar_estado_sistema(self, cambios: Dict = None):
         """Muestra el estado actual del sistema usando tablas tabuladas"""
@@ -745,7 +807,7 @@ class SimuladorSO:
         procesos_suspendidos = len(self.procesos_suspendidos)
         print(f"\nGrado de Multiprogramación: {grado_actual}/{self.max_multiprogramacion}")
         print(f"  - En RAM: {procesos_en_ram}/3")
-        print(f"  - Suspendidos: {procesos_suspendidos}/2")
+        print(f"  - Suspendidos: {procesos_suspendidos}")
         
         # Mostrar eventos si hay cambios
         if cambios:
@@ -844,22 +906,68 @@ class SimuladorSO:
         self.estado_previo['cola_suspendidos_len'] = len(self.procesos_suspendidos)
         self.estado_previo['proceso_ejecutando'] = self.planificador.proceso_actual.id if self.planificador.proceso_actual else None
         
+        # Mostrar estado inicial
+        if mostrar_pasos:
+            self.mostrar_estado_sistema({'hay_cambios': True})
+            input("\nPresiona Enter para avanzar al próximo cambio de contexto...")
+        
         # Continuar mientras haya procesos por procesar o ejecutar
         while (self.procesos_nuevos or 
                self.planificador.cola_listos or 
-               self.planificador.proceso_actual or
+               (self.planificador.proceso_actual and self.planificador.proceso_actual.id != 1) or
                self.procesos_suspendidos):
             
-            # Ejecutar ciclo y obtener cambios
+            # Calcular próximo evento
+            tiempo_proximo_evento = self.calcular_tiempo_proximo_evento()
+            
+            # Si el próximo evento es en el futuro, avanzar el tiempo y actualizar tiempo_restante
+            if tiempo_proximo_evento > self.tiempo_actual:
+                tiempo_delta = tiempo_proximo_evento - self.tiempo_actual
+                
+                # Si hay un proceso ejecutándose (y no es SO), actualizar su tiempo_restante
+                if (self.planificador.proceso_actual and 
+                    self.planificador.proceso_actual.id != 1 and
+                    self.planificador.proceso_actual.estado == EstadoProceso.EJECUCION):
+                    # Actualizar tiempo_restante directamente
+                    proceso = self.planificador.proceso_actual
+                    tiempo_a_restar = min(tiempo_delta, proceso.tiempo_restante)
+                    proceso.tiempo_restante -= tiempo_a_restar
+                    
+                    # Si el proceso tiene tiempo_inicio None, inicializarlo
+                    if proceso.tiempo_inicio is None:
+                        proceso.tiempo_inicio = self.tiempo_actual
+                    
+                    # Si el proceso terminó (tiempo_restante llegó a 0)
+                    if proceso.tiempo_restante <= 0:
+                        proceso.tiempo_restante = 0
+                        proceso.tiempo_finalizacion = tiempo_proximo_evento
+                        # El proceso se marcará como terminado en ejecutar_ciclo
+                
+                # Avanzar tiempo al evento
+                self.tiempo_actual = tiempo_proximo_evento
+            elif tiempo_proximo_evento == self.tiempo_actual:
+                # El evento es en el tiempo actual, no necesitamos avanzar tiempo
+                # pero sí necesitamos verificar si hay un proceso ejecutándose que necesita tiempo_inicio
+                if (self.planificador.proceso_actual and 
+                    self.planificador.proceso_actual.id != 1 and
+                    self.planificador.proceso_actual.estado == EstadoProceso.EJECUCION and
+                    self.planificador.proceso_actual.tiempo_inicio is None):
+                    self.planificador.proceso_actual.tiempo_inicio = self.tiempo_actual
+            
+            # Ejecutar ciclo en el tiempo del evento (procesar arribos, cambios, etc.)
             cambios = self.ejecutar_ciclo()
             
-            # Mostrar estado del sistema
+            # Mostrar estado solo si hay cambios significativos
             if mostrar_pasos:
-                self.mostrar_estado_sistema(cambios)
-                input("\nPresiona Enter para avanzar una unidad de tiempo...")
-            
-            # Actualizar tiempo
-            self.tiempo_actual += 1
+                if cambios.get('hay_cambios', False):
+                    self.mostrar_estado_sistema(cambios)
+                    input("\nPresiona Enter para avanzar al próximo cambio de contexto...")
+                elif not (self.procesos_nuevos or 
+                         self.planificador.cola_listos or 
+                         (self.planificador.proceso_actual and self.planificador.proceso_actual.id != 1) or
+                         self.procesos_suspendidos):
+                    # Si no hay más procesos, terminar
+                    break
             
             # Actualizar estado previo para detectar cambios
             self.estado_previo['grado_multiprogramacion'] = self.calcular_grado_multiprogramacion()
