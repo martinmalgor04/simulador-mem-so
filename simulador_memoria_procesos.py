@@ -1,6 +1,11 @@
 """
 Simulador de Asignación de Memoria y Planificación de Procesos
-Implementa Best-Fit para asignación de memoria y SRTF para planificación de CPU
+============================================================
+Este programa simula un Sistema Operativo básico con las siguientes características:
+- Gestión de Memoria: Particiones fijas con algoritmo Best-Fit.
+- Planificación de CPU: Algoritmo SRTF (Shortest Remaining Time First).
+- Multiprogramación: Grado máximo de 5 procesos (3 en RAM + 2 suspendidos).
+
 Autor: Sistema de Simulación de SO
 """
 
@@ -9,1022 +14,802 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 import os
+import sys
+import subprocess
+
+# Intentar importar tabulate, instalar si no existe
 try:
     from tabulate import tabulate
 except ImportError:
     print("Advertencia: tabulate no está instalado. Instalando...")
-    import subprocess
-    import sys
     subprocess.check_call([sys.executable, "-m", "pip", "install", "tabulate"])
     from tabulate import tabulate
 
+# --- GESTIÓN DE COLORES PARA LA TERMINAL ---
+class Colores:
+    """Códigos de escape ANSI para colorear la salida en terminal"""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    ROJO = "\033[91m"
+    VERDE = "\033[92m"
+    AMARILLO = "\033[93m"
+    AZUL = "\033[94m"
+    MAGENTA = "\033[95m"
+    CIAN = "\033[96m"
+    BLANCO = "\033[97m"
+
+    # Fondos
+    BG_ROJO = "\033[41m"
+    BG_VERDE = "\033[42m"
+    BG_AZUL = "\033[44m"
+
+    # Estilos extra
+    ITALIC = "\033[3m"
+
 class EstadoProceso(Enum):
+    """Enumeración de los posibles estados de un proceso"""
     NUEVO = "Nuevo"
     LISTO = "Listo"
     LISTO_SUSPENDIDO = "Listo/Suspendido"
     EJECUCION = "Ejecución"
     TERMINADO = "Terminado"
 
+    def __str__(self):
+        return self.value
+
 @dataclass
 class Proceso:
-    """Representa un proceso en el sistema"""
-    id: int
-    tamaño: int  # En KB
-    tiempo_arribo: int
-    tiempo_irrupcion: int
-    titulo: str = ""
-    tiempo_restante: int = None
-    tiempo_inicio: int = None
-    tiempo_finalizacion: int = None
+    """
+    Representa un proceso (PCB - Process Control Block simplificado).
+    Contiene toda la información necesaria para gestionar el ciclo de vida del proceso.
+    """
+    id: str                     # Identificador del proceso (String para permitir A1, P1, etc.)
+    tamaño: int                 # Tamaño en KB requerido en memoria
+    tiempo_arribo: int          # Momento en que el proceso llega al sistema
+    tiempo_irrupcion: int       # Tiempo total de CPU necesario (Burst Time)
+    titulo: str = ""            # Nombre descriptivo del proceso
+
+    # Atributos de gestión (se inicializan o calculan durante la ejecución)
+    tiempo_restante: int = None      # Tiempo de CPU que le falta para terminar
+    tiempo_inicio: int = None        # Momento en que entra a ejecución por primera vez
+    tiempo_finalizacion: int = None  # Momento en que termina su ejecución
     estado: EstadoProceso = EstadoProceso.NUEVO
-    particion_asignada: int = None
-    
+    particion_asignada: int = None   # ID de la partición de memoria asignada
+
     def __post_init__(self):
+        """Inicializa el tiempo restante igual a la irrupción al crear el objeto"""
         if self.tiempo_restante is None:
             self.tiempo_restante = self.tiempo_irrupcion
-    
+
     def __lt__(self, other):
-        """Para usar en heap - prioridad por tiempo restante más corto"""
+        """
+        Sobrecarga del operador 'menor que' (<).
+        Crucial para el algoritmo SRTF: permite que el heap ordene automáticamente
+        los procesos por 'tiempo_restante' ascendente (Min-Heap).
+        """
+        if self.tiempo_restante == other.tiempo_restante:
+            # Desempate por orden de llegada (FIFO) si tienen mismo tiempo restante
+            return self.tiempo_arribo < other.tiempo_arribo
         return self.tiempo_restante < other.tiempo_restante
 
 @dataclass
 class Particion:
-    """Representa una partición de memoria"""
+    """Representa una partición fija de memoria"""
     id: int
-    direccion_inicio: int  # En KB
-    tamaño: int  # En KB
-    proceso_asignado: Optional[int] = None
-    
+    direccion_inicio: int           # Dirección base en KB
+    tamaño: int                     # Tamaño total de la partición en KB
+    proceso_asignado: Optional[str] = None # ID del proceso asignado (None si está libre)
+
     @property
     def libre(self) -> bool:
         return self.proceso_asignado is None
-    
+
     @property
     def fragmentacion_interna(self) -> int:
-        """Inicializa la fragmentación interna de la partición"""
-        if self.libre:
-            return 0
-        return 0
+        """La fragmentación se calcula dinámicamente según el proceso asignado"""
+        return 0 # El cálculo real se hace en el GestorMemoria
 
 class GestorMemoria:
-    """Gestor de memoria con particiones fijas y algoritmo Best-Fit"""
-    
+    """
+    Simula la unidad de gestión de memoria (MMU simplificada).
+    Utiliza Particiones Fijas y algoritmo de asignación Best-Fit.
+    """
+
     def __init__(self):
-        # Configuración de particiones según especificación
+        # Configuración de particiones fijas según especificación del TP
         self.particiones = [
-            Particion(0, 0, 100),    # Sistema Operativo
-            Particion(1, 100, 250), # Trabajos grandes
-            Particion(2, 350, 150), # Trabajos medianos
-            Particion(3, 500, 50),  # Trabajos pequeños
+            Particion(0, 0, 100),    # Partición 0: Reservada para SO
+            Particion(1, 100, 250),  # Partición 1: Trabajos grandes
+            Particion(2, 350, 150),  # Partición 2: Trabajos medianos
+            Particion(3, 500, 50),   # Partición 3: Trabajos pequeños
         ]
-        self.procesos_en_memoria: Dict[int, Proceso] = {}
-        
-        # Inicializar proceso Sistema Operativo en partición 0 (permanente)
-        proceso_so = Proceso(id=1, tamaño=100, tiempo_arribo=0, tiempo_irrupcion=0, titulo="Sistema Operativo")
+        # Mapa para búsqueda rápida de procesos en memoria: {id_proceso: ObjetoProceso}
+        self.procesos_en_memoria: Dict[str, Proceso] = {}
+
+        # Cargar el Sistema Operativo en memoria (Partición 0)
+        self._cargar_so()
+
+    def _cargar_so(self):
+        """Inicializa el proceso del SO en la partición reservada"""
+        # ID del SO es "1" (como string)
+        proceso_so = Proceso(id="1", tamaño=100, tiempo_arribo=0, tiempo_irrupcion=0, titulo="Sistema Operativo")
         proceso_so.estado = EstadoProceso.EJECUCION
         proceso_so.particion_asignada = 0
-        self.particiones[0].proceso_asignado = 1
-        self.procesos_en_memoria[1] = proceso_so
-    
+        self.particiones[0].proceso_asignado = "1"
+        self.procesos_en_memoria["1"] = proceso_so
+
     def asignar_memoria(self, proceso: Proceso) -> bool:
         """
-        Asigna memoria usando algoritmo Best-Fit
-        Retorna True si se pudo asignar, False si no
+        Intenta asignar memoria a un proceso usando el algoritmo **Best-Fit**.
+
+        Best-Fit: Busca la partición libre más pequeña donde quepa el proceso.
+        Esto minimiza la fragmentación interna, aunque puede dejar huecos muy pequeños ("astillas").
+
+        Retorna: True si se asignó, False si no hay partición adecuada disponible.
         """
-        # No permitir asignar el SO (id 1) a otra partición
-        if proceso.id == 1:
+        # Seguridad: No reasignar SO
+        if proceso.id == "1":
             return False
-        
-        # Excluir partición 0 (Sistema Operativo)
-        particiones_disponibles = [p for p in self.particiones[1:] 
-                                 if p.libre and p.tamaño >= proceso.tamaño]
-        
-        if not particiones_disponibles:
+
+        # 1. Filtrar particiones candidatas (Libres, tamaño suficiente, no es la del SO)
+        particiones_candidatas = [
+            p for p in self.particiones[1:]
+            if p.libre and p.tamaño >= proceso.tamaño
+        ]
+
+        if not particiones_candidatas:
             return False
-        
-        # Best-Fit: seleccionar la partición más pequeña que quepa el proceso
-        mejor_particion = min(particiones_disponibles, key=lambda p: p.tamaño)
-        
-        # Asignar proceso a la partición
+
+        # 2. Aplicar Best-Fit: Elegir la candidata con menor tamaño
+        mejor_particion = min(particiones_candidatas, key=lambda p: p.tamaño)
+
+        # 3. Asignar
         mejor_particion.proceso_asignado = proceso.id
         proceso.particion_asignada = mejor_particion.id
         self.procesos_en_memoria[proceso.id] = proceso
-        
+
         return True
-    
-    def liberar_memoria(self, proceso_id: int) -> bool:
-        """Libera la memoria ocupada por un proceso"""
-        if proceso_id not in self.procesos_en_memoria:
+
+    def liberar_memoria(self, proceso_id: str) -> bool:
+        """Libera la partición ocupada por un proceso."""
+        if proceso_id not in self.procesos_en_memoria or proceso_id == "1":
             return False
-        
-        # No permitir liberar el proceso del Sistema Operativo (id 1)
-        if proceso_id == 1:
-            return False
-        
+
         proceso = self.procesos_en_memoria[proceso_id]
         particion = self.particiones[proceso.particion_asignada]
-        particion.proceso_asignado = None
-        
+        particion.proceso_asignado = None # Marcar partición como libre
+
         del self.procesos_en_memoria[proceso_id]
         return True
-    
+
     def obtener_fragmentacion_interna(self, particion_id: int) -> int:
-        """Calcula la fragmentación interna de una partición"""
+        """Calcula desperdicio de memoria: Tamaño Partición - Tamaño Proceso"""
         particion = self.particiones[particion_id]
-        if particion.libre:
+        if particion.libre or particion.proceso_asignado == "1": # SO no tiene fragmentación visible
             return 0
-        
-        if particion.proceso_asignado not in self.procesos_en_memoria:
+
+        proceso = self.procesos_en_memoria.get(particion.proceso_asignado)
+        if not proceso:
             return 0
-        
-        proceso = self.procesos_en_memoria[particion.proceso_asignado]
-        
-        # El SO (id 1) siempre está en partición 0 y no tiene fragmentación
-        if proceso.id == 1:
-            return 0
-        
+
         return particion.tamaño - proceso.tamaño
-    
-    def obtener_tabla_particiones(self) -> List[Dict]:
-        """Retorna información de todas las particiones"""
-        tabla = []
-        for particion in self.particiones:
-            # Obtener información del proceso si está asignado
-            tiempo_restante = None
-            titulo_proceso = None
-            proceso_id = particion.proceso_asignado
-            
-            if particion.proceso_asignado and particion.proceso_asignado in self.procesos_en_memoria:
-                proceso = self.procesos_en_memoria[particion.proceso_asignado]
-                tiempo_restante = proceso.tiempo_restante
-                titulo_proceso = proceso.titulo
-            
-            info = {
-                'id': particion.id,
-                'direccion_inicio': particion.direccion_inicio,
-                'tamaño': particion.tamaño,
-                'proceso_asignado': proceso_id,
-                'titulo_proceso': titulo_proceso,
-                'tiempo_restante': tiempo_restante,
-                'fragmentacion_interna': self.obtener_fragmentacion_interna(particion.id)
-            }
-            tabla.append(info)
-        return tabla
+
+    def obtener_tabla_particiones(self) -> List[List]:
+        """Genera los datos para la tabla visual de particiones"""
+        datos_tabla = []
+        for p in self.particiones:
+            # Datos por defecto (Partición Libre)
+            estado_str = f"{Colores.VERDE}Libre{Colores.RESET}"
+            proceso_info = "-"
+            frag_str = "-"
+            tiempo_restante_str = "-"
+            tam_proceso_str = "-"
+
+            # Datos si está ocupada
+            if not p.libre:
+                pid = p.proceso_asignado
+                if pid == "1":
+                    estado_str = f"{Colores.AZUL}SO{Colores.RESET}"
+                    proceso_info = "Sistema Operativo"
+                    frag_str = "0 KB"
+                    tiempo_restante_str = "∞"
+                    tam_proceso_str = "100 KB"
+                else:
+                    proc = self.procesos_en_memoria.get(pid)
+                    if proc:
+                        estado_str = f"{Colores.ROJO}Ocupada{Colores.RESET}"
+                        proceso_info = f"ID: {pid} ({proc.titulo})"
+                        frag = self.obtener_fragmentacion_interna(p.id)
+                        frag_str = f"{frag} KB"
+                        tiempo_restante_str = f"{proc.tiempo_restante}"
+                        tam_proceso_str = f"{proc.tamaño} KB"
+
+            datos_tabla.append([
+                f"#{p.id}",
+                f"{p.tamaño} KB",
+                tam_proceso_str,
+                estado_str,
+                proceso_info,
+                frag_str,
+                tiempo_restante_str
+            ])
+        return datos_tabla
 
 class PlanificadorSRTF:
-    """Planificador con algoritmo Shortest Remaining Time First (SRTF)"""
-    
+    """
+    Planificador de CPU con algoritmo SRTF (Shortest Remaining Time First).
+    Es la versión apropiativa (preemptive) de SJF.
+    """
+
     def __init__(self):
-        self.cola_listos = []  # Min-heap por tiempo restante
+        # Min-Heap para mantener procesos ordenados por tiempo restante eficientemente
+        self.cola_listos = []
         self.proceso_actual: Optional[Proceso] = None
-    
+
     def agregar_proceso_listo(self, proceso: Proceso):
-        """Agrega un proceso a la cola de listos (excluyendo SO)"""
-        # No agregar el SO (id 1) a la cola de listos
-        if proceso.id == 1:
-            return
+        """Ingresa un proceso a la cola de listos."""
+        if proceso.id == "1": return # Ignorar SO
+
         proceso.estado = EstadoProceso.LISTO
         heapq.heappush(self.cola_listos, proceso)
-    
+
     def obtener_siguiente_proceso(self) -> Optional[Proceso]:
-        """Obtiene el siguiente proceso a ejecutar según SRTF"""
+        """Extrae el proceso con menor tiempo restante del heap."""
         if not self.cola_listos:
             return None
-        
         return heapq.heappop(self.cola_listos)
-    
+
     def ejecutar_proceso(self, proceso: Proceso, tiempo_actual: int):
-        """Ejecuta un proceso por una unidad de tiempo"""
+        """Simula la ejecución de un ciclo de CPU para el proceso."""
         if proceso.tiempo_inicio is None:
             proceso.tiempo_inicio = tiempo_actual
-        
+
         proceso.estado = EstadoProceso.EJECUCION
-        
-        # Evitar que tiempo_restante sea negativo
+
         if proceso.tiempo_restante > 0:
             proceso.tiempo_restante -= 1
-        
+
         if proceso.tiempo_restante == 0:
             proceso.estado = EstadoProceso.TERMINADO
             proceso.tiempo_finalizacion = tiempo_actual + 1
-    
+
     def verificar_apropiacion(self, nuevo_proceso: Proceso) -> bool:
-        """Verifica si un nuevo proceso debe apropiarse de la CPU"""
+        """
+        Regla de oro de SRTF: Si llega un proceso con menor tiempo restante
+        que el que se está ejecutando, se produce una apropiación (context switch).
+        """
         if self.proceso_actual is None:
             return True
-        
         return nuevo_proceso.tiempo_restante < self.proceso_actual.tiempo_restante
 
 class SimuladorSO:
-    """Simulador principal del Sistema Operativo"""
-    
+    """
+    Clase principal que orquesta la Memoria, el Planificador y los Eventos.
+    """
+
+    MAX_MULTIPROGRAMACION = 5 # Límite estricto del TP: 3 en RAM + 2 Suspendidos
+
     def __init__(self):
         self.gestor_memoria = GestorMemoria()
         self.planificador = PlanificadorSRTF()
-        # procesos_nuevos: Contiene procesos que aún no han arribado Y procesos que ya arribaron 
-        # pero están esperando por grado de multiprogramación máximo (ordenados por tiempo_irrupcion)
-        self.procesos_nuevos = []
-        self.procesos_suspendidos = []
-        self.procesos_terminados = []
+
+        # Colas de procesos
+        self.procesos_nuevos = []      # Aún no arriban o esperando cupo
+        self.procesos_suspendidos = [] # En disco (Listo/Suspendido)
+        self.procesos_terminados = []  # Finalizados
+
         self.tiempo_actual = 0
-        self.max_multiprogramacion = 5
-        # Estados previos para detectar cambios
-        self.estado_previo = {
-            'grado_multiprogramacion': 0,
-            'cola_listos_len': 0,
-            'cola_suspendidos_len': 0,
-            'proceso_ejecutando': None,
-            'procesos_en_memoria': set()
-        }
-    
+
+        # Control de cambios para la interfaz gráfica
+        self.estado_previo = {}
+
     def calcular_grado_multiprogramacion(self) -> int:
         """
-        Calcula el grado de multiprogramación actual
-        Grado = Procesos en RAM + Procesos suspendidos
-        - RAM: máximo 3 procesos (hay 3 particiones disponibles, excluyendo SO)
-        - Suspendidos: máximo 2 procesos, pueden haber mas en casos especiales.
-        - Total: máximo 5 procesos
+        Grado actual = Procesos en RAM (excluyendo SO) + Procesos Suspendidos.
         """
-        # Procesos en RAM (excluyendo SO que siempre está)
-        procesos_en_ram = len([p for p in self.gestor_memoria.procesos_en_memoria.values() 
-                              if p.id != 1])
-        
-        # Procesos suspendidos (en disco)
-        procesos_suspendidos = len(self.procesos_suspendidos)
-        
-        # Grado total de multiprogramación
-        return procesos_en_ram + procesos_suspendidos
-    
-    def aplicar_apropiacion_srtf(self, proceso_nuevo: Proceso) -> bool:
-        """
-        Aplica apropiación SRTF si el nuevo proceso es más corto que el actual
-        Retorna True si se aplicó apropiación
-        """
-        if not self.planificador.proceso_actual:
-            return False
-        
-        if not self.planificador.verificar_apropiacion(proceso_nuevo):
-            return False
-        
-        # Apropiación: devolver proceso actual a cola de listos
-        proceso_anterior = self.planificador.proceso_actual
-        proceso_anterior.estado = EstadoProceso.LISTO
-        self.planificador.agregar_proceso_listo(proceso_anterior)
-        self.planificador.proceso_actual = None
-        return True
-    
+        en_ram = len([p for p in self.gestor_memoria.procesos_en_memoria.values() if p.id != "1"])
+        return en_ram + len(self.procesos_suspendidos)
+
+    # --- LÓGICA DE TRANSICIÓN DE ESTADOS ---
+
     def admitir_proceso_a_ram(self, proceso: Proceso, verificar_apropiacion: bool = True) -> bool:
-        """
-        Intenta admitir un proceso a RAM asignándole memoria
-        Retorna True si se admitió exitosamente
-        """
-        # No admitir el SO (id 1) a la cola de listos
-        if proceso.id == 1:
-            return False
-        
+        """Intenta pasar un proceso a estado LISTO (asignándole RAM)."""
+        if proceso.id == "1": return False
+
         if not self.gestor_memoria.asignar_memoria(proceso):
             return False
-        
-        # Verificar apropiación SRTF si es necesario
-        if verificar_apropiacion:
-            self.aplicar_apropiacion_srtf(proceso)
-        
-        # Agregar proceso a cola de listos
+
+        # Verificar si este proceso debe expropiar al actual (SRTF)
+        if verificar_apropiacion and self.planificador.proceso_actual:
+            if self.planificador.verificar_apropiacion(proceso):
+                # Desalojar proceso actual
+                proc_saliente = self.planificador.proceso_actual
+                proc_saliente.estado = EstadoProceso.LISTO
+                self.planificador.agregar_proceso_listo(proc_saliente)
+                self.planificador.proceso_actual = None
+
         self.planificador.agregar_proceso_listo(proceso)
         return True
-    
-    def cargar_procesos_desde_archivo(self, nombre_archivo: str) -> bool:
-        """
-        Carga procesos desde un archivo
-        Formato esperado: ID_Proceso,Tamaño_KB,Tiempo_Arribo,Tiempo_Irrupción,Título
-        """
-        try:
-            if not os.path.exists(nombre_archivo):
-                print(f"Error: El archivo {nombre_archivo} no existe")
-                return False
-                
-            with open(nombre_archivo, 'r') as archivo:
-                for num_linea, linea in enumerate(archivo, 1):
-                    linea = linea.strip()
-                    if linea and not linea.startswith('#'):
-                        datos = linea.split(',')
-                        if len(datos) >= 4:
-                            proceso_id = int(datos[0])
-                            # Rechazar procesos con id=1 porque está reservado para el SO
-                            if proceso_id == 1:
-                                print(f"Advertencia (línea {num_linea}): El proceso con ID=1 está reservado para el Sistema Operativo. Ignorando proceso.")
-                                continue
-                            
-                            # El título es opcional (5ta columna), si no está presente usar vacío
-                            titulo = datos[4].strip() if len(datos) >= 5 else f"Proceso {proceso_id}"
-                            
-                            proceso = Proceso(
-                                id=proceso_id,
-                                tamaño=int(datos[1]),
-                                tiempo_arribo=int(datos[2]),
-                                tiempo_irrupcion=int(datos[3]),
-                                titulo=titulo
-                            )
-                            self.procesos_nuevos.append(proceso)
-                        else:
-                            print(f"Advertencia (línea {num_linea}): Formato incorrecto, se requieren al menos 4 campos separados por coma.")
-            
-            # Ordenar por tiempo de arribo
-            self.procesos_nuevos.sort(key=lambda p: p.tiempo_arribo)
-            print(f"✓ Cargados {len(self.procesos_nuevos)} procesos desde el archivo.")
-            return True
-            
-        except Exception as e:
-            print(f"Error al cargar procesos: {e}")
-            return False
-    
-    def cargar_procesos_manual(self) -> bool:
-        """
-        Carga procesos manualmente por consola
-        El usuario ingresa los procesos uno por uno
-        """
-        print("\n=== CARGA MANUAL DE PROCESOS ===")
-        print("Ingrese los datos de cada proceso.")
-        print("Formato: ID, Tamaño (KB), Tiempo de Arribo, Tiempo de Irrupción, Título")
-        print("Ingrese 'fin' cuando haya terminado de cargar procesos.\n")
-        
-        proceso_num = 1
-        ids_usados = set()
-        
-        while True:
-            try:
-                entrada = input(f"Proceso {proceso_num} (o 'fin' para terminar): ").strip()
-                
-                if entrada.lower() == 'fin':
-                    break
-                
-                if not entrada:
-                    continue
-                
-                datos = [d.strip() for d in entrada.split(',')]
-                
-                if len(datos) < 4:
-                    print("❌ Error: Debe ingresar al menos 4 valores: ID, Tamaño, Tiempo de Arribo, Tiempo de Irrupción, Título (opcional)")
-                    continue
-                
-                proceso_id = int(datos[0])
-                
-                # Validaciones
-                if proceso_id == 1:
-                    print("❌ Error: El ID=1 está reservado para el Sistema Operativo.")
-                    continue
-                
-                if proceso_id in ids_usados:
-                    print(f"❌ Error: El ID {proceso_id} ya fue utilizado.")
-                    continue
-                
-                if len(ids_usados) >= 10:
-                    print("❌ Error: Se ha alcanzado el máximo de 10 procesos.")
-                    break
-                
-                tamaño = int(datos[1])
-                tiempo_arribo = int(datos[2])
-                tiempo_irrupcion = int(datos[3])
-                titulo = datos[4] if len(datos) >= 5 and datos[4] else f"Proceso {proceso_id}"
-                
-                # Validar valores positivos
-                if tamaño <= 0 or tiempo_irrupcion <= 0 or tiempo_arribo < 0:
-                    print("❌ Error: Tamaño y Tiempo de Irrupción deben ser mayores a 0. Tiempo de Arribo debe ser >= 0.")
-                    continue
-                
-                proceso = Proceso(
-                    id=proceso_id,
-                    tamaño=tamaño,
-                    tiempo_arribo=tiempo_arribo,
-                    tiempo_irrupcion=tiempo_irrupcion,
-                    titulo=titulo
-                )
-                
-                self.procesos_nuevos.append(proceso)
-                ids_usados.add(proceso_id)
-                proceso_num += 1
-                print(f"✓ Proceso {proceso_id} ({titulo}) agregado correctamente.\n")
-                
-            except ValueError:
-                print("❌ Error: Los valores numéricos deben ser enteros válidos.")
-            except Exception as e:
-                print(f"❌ Error inesperado: {e}")
-        
-        if not self.procesos_nuevos:
-            print("\n⚠ No se cargaron procesos.")
-            return False
-        
-        # Ordenar por tiempo de arribo
-        self.procesos_nuevos.sort(key=lambda p: p.tiempo_arribo)
-        print(f"\n✓ Total de procesos cargados: {len(self.procesos_nuevos)}")
-        return True
-    
-    def procesar_arribos(self):
-        """
-        Procesa los procesos que llegan en el tiempo actual
-        Los procesos están en procesos_nuevos ordenados por tiempo_arribo
-        Retorna True si hubo procesos que arribaron
-        """
-        procesos_arribados = []
-        # Procesar procesos que acaban de arribar (tiempo_arribo <= tiempo_actual)
-        for proceso in self.procesos_nuevos[:]:
-            if proceso.tiempo_arribo <= self.tiempo_actual:
-                # Remover de nuevos y intentar admitir
-                self.procesos_nuevos.remove(proceso)
-                procesos_arribados.append(proceso)
-                # Intentar admitir (si no se puede, vuelve a procesos_nuevos)
-                self.intentar_admitir_proceso(proceso)
-        return len(procesos_arribados) > 0
-    
-    def buscar_proceso_suspendido_mas_corto(self, proceso_actual: Optional[Proceso]) -> Optional[Proceso]:
-        """Busca el proceso suspendido con menor tiempo restante"""
-        if not self.procesos_suspendidos:
-            return None
-        
-        proceso_mas_corto = min(self.procesos_suspendidos, key=lambda p: p.tiempo_restante)
-        
-        # Si hay proceso en ejecución, verificar si el suspendido es más corto
-        if proceso_actual:
-            if proceso_mas_corto.tiempo_restante < proceso_actual.tiempo_restante:
-                return proceso_mas_corto
-            return None
-        
-        # Si no hay proceso en ejecución, retornar el más corto
-        return proceso_mas_corto
-    
-    def agregar_a_cola_nuevos(self, proceso: Proceso):
-        """Agrega un proceso a la cola de nuevos y ordena por tiempo de arribo"""
-        proceso.estado = EstadoProceso.NUEVO
-        if proceso not in self.procesos_nuevos:
-            self.procesos_nuevos.append(proceso)
-        # Ordenar solo por tiempo de arribo
-        self.procesos_nuevos.sort(key=lambda p: p.tiempo_arribo)
-    
+
     def intentar_admitir_proceso(self, proceso: Proceso) -> bool:
         """
-        Intenta admitir un nuevo proceso al sistema
-        Retorna True si se admitió, False si no
+        Gestiona la admisión de un proceso nuevo al sistema.
+        Decide si va a RAM (Listo) o a Disco (Suspendido) según disponibilidad.
         """
-        # Asegurarse de que el proceso no esté en ninguna lista previamente
-        if proceso in self.procesos_nuevos:
-            self.procesos_nuevos.remove(proceso)
-        if proceso in self.procesos_suspendidos:
-            self.procesos_suspendidos.remove(proceso)
-        
-        # Verificar grado de multiprogramación
-        if self.calcular_grado_multiprogramacion() >= self.max_multiprogramacion:
+        # Limpieza previa
+        if proceso in self.procesos_nuevos: self.procesos_nuevos.remove(proceso)
+        if proceso in self.procesos_suspendidos: self.procesos_suspendidos.remove(proceso)
+
+        # Verificar límite global de multiprogramación
+        if self.calcular_grado_multiprogramacion() >= self.MAX_MULTIPROGRAMACION:
             self.agregar_a_cola_nuevos(proceso)
             return False
-        
-        # Intentar admitir a RAM
+
+        # Intento 1: Asignar directamente a RAM
         if self.admitir_proceso_a_ram(proceso):
             return True
-        
-        # No hay memoria disponible pero grado < 5 - ir a suspendidos
+
+        # Intento 2: Si no hay RAM pero hay cupo de multiprogramación -> Suspendido
         proceso.estado = EstadoProceso.LISTO_SUSPENDIDO
         if proceso not in self.procesos_suspendidos:
             self.procesos_suspendidos.append(proceso)
         return False
-    
+
     def intentar_swap_srtf(self) -> bool:
         """
-        Intenta hacer swap SRTF con procesos suspendidos
-        Retorna True si se hizo un swap
+        Implementa una optimización agresiva de SRTF:
+        Si un proceso en SUSPENDIDO tiene menor tiempo restante que el que se está
+        EJECUTANDO en RAM, vale la pena hacer un SWAP (Intercambio).
+        Ahora siempre se intenta hacer swap si hay un candidato más corto, incluso
+        si se supera temporalmente el grado de multiprogramación máximo.
         """
-        if not self.planificador.proceso_actual:
-            return False
-        
-        # Buscar proceso suspendido más corto
-        proceso_suspendido = self.buscar_proceso_suspendido_mas_corto(self.planificador.proceso_actual)
-        
-        if not proceso_suspendido:
-            return False
-        
-        # Verificar grado de multiprogramación antes de hacer swap
-        grado_actual = self.calcular_grado_multiprogramacion()
-        if grado_actual >= self.max_multiprogramacion:
-            # Necesitamos liberar memoria del proceso actual para hacer swap
-            proceso_actual = self.planificador.proceso_actual
-            # Liberar memoria del proceso actual
-            self.gestor_memoria.liberar_memoria(proceso_actual.id)
-            proceso_actual.estado = EstadoProceso.LISTO_SUSPENDIDO
-            self.procesos_suspendidos.append(proceso_actual)
+        if not self.planificador.proceso_actual: return False
+
+        # Buscar el mejor candidato en suspendidos (el más corto)
+        candidato = self.buscar_proceso_suspendido_mas_corto(self.planificador.proceso_actual)
+        if not candidato: return False
+
+        # Realizar SWAP - siempre se hace si hay un candidato más corto
+        proc_saliente = self.planificador.proceso_actual
+
+        # 1. Sacar de RAM al actual
+        self.gestor_memoria.liberar_memoria(proc_saliente.id)
+        proc_saliente.estado = EstadoProceso.LISTO_SUSPENDIDO
+        self.procesos_suspendidos.append(proc_saliente)
+
+        # 2. Meter a RAM al candidato (Best-Fit encontrará hueco ahora)
+        if self.gestor_memoria.asignar_memoria(candidato):
+            self.procesos_suspendidos.remove(candidato)
+            candidato.estado = EstadoProceso.EJECUCION
+            if candidato.tiempo_inicio is None:
+                candidato.tiempo_inicio = self.tiempo_actual
+            self.planificador.proceso_actual = candidato
+            return True
         else:
-            # Si hay espacio, solo mover el actual a cola de listos
-            proceso_actual = self.planificador.proceso_actual
-            proceso_actual.estado = EstadoProceso.LISTO
-            self.planificador.agregar_proceso_listo(proceso_actual)
-        
-        # Intentar asignar memoria al suspendido
-        if not self.gestor_memoria.asignar_memoria(proceso_suspendido):
-            # Si no se puede asignar, revertir cambios
-            if proceso_actual.estado == EstadoProceso.LISTO_SUSPENDIDO:
-                self.procesos_suspendidos.remove(proceso_actual)
-                self.gestor_memoria.asignar_memoria(proceso_actual)
-                proceso_actual.estado = EstadoProceso.LISTO
-                self.planificador.agregar_proceso_listo(proceso_actual)
-                self.planificador.proceso_actual = proceso_actual
+            # Rollback si falla la asignación (muy raro si acabamos de liberar)
+            self.procesos_suspendidos.remove(proc_saliente)
+            self.gestor_memoria.asignar_memoria(proc_saliente)
+            self.planificador.proceso_actual = proc_saliente
+            proc_saliente.estado = EstadoProceso.EJECUCION
             return False
-        
-        # Sacar suspendido de la lista y ponerlo en ejecución
-        self.procesos_suspendidos.remove(proceso_suspendido)
-        proceso_suspendido.estado = EstadoProceso.EJECUCION
-        # Establecer tiempo_inicio si es la primera vez que se ejecuta
-        if proceso_suspendido.tiempo_inicio is None:
-            proceso_suspendido.tiempo_inicio = self.tiempo_actual
-        self.planificador.proceso_actual = proceso_suspendido
-        
-        return True
-    
+
+    # --- MÉTODOS AUXILIARES ---
+    def agregar_a_cola_nuevos(self, proceso: Proceso):
+        proceso.estado = EstadoProceso.NUEVO
+        if proceso not in self.procesos_nuevos:
+            self.procesos_nuevos.append(proceso)
+        self.procesos_nuevos.sort(key=lambda p: p.tiempo_arribo)
+
+    def buscar_proceso_suspendido_mas_corto(self, proceso_actual: Optional[Proceso]) -> Optional[Proceso]:
+        if not self.procesos_suspendidos: return None
+        mejor_suspendido = min(self.procesos_suspendidos, key=lambda p: p.tiempo_restante)
+
+        if proceso_actual and mejor_suspendido.tiempo_restante < proceso_actual.tiempo_restante:
+            return mejor_suspendido
+        return None # No vale la pena hacer swap
+
+    def procesar_arribos(self) -> bool:
+        """Verifica procesos que llegan en t = tiempo_actual"""
+        arribados = []
+        for p in self.procesos_nuevos[:]:
+            if p.tiempo_arribo <= self.tiempo_actual:
+                self.procesos_nuevos.remove(p)
+                arribados.append(p)
+                self.intentar_admitir_proceso(p)
+        return len(arribados) > 0
+
+    def intentar_admitir_suspendidos(self) -> List[Proceso]:
+        """Intenta mover procesos de Suspendido -> Listo cuando se libera RAM"""
+        admitidos = []
+        # Ordenar por SRTF para dar prioridad al más corto
+        candidatos = sorted(self.procesos_suspendidos, key=lambda p: p.tiempo_restante)
+
+        for p in candidatos:
+            if self.calcular_grado_multiprogramacion() >= self.MAX_MULTIPROGRAMACION: break
+
+            # Intentar mover a RAM
+            if self.admitir_proceso_a_ram(p):
+                admitidos.append(p)
+                self.procesos_suspendidos.remove(p)
+        return admitidos
+
+    def intentar_admitir_procesos_nuevos(self) -> List[Proceso]:
+        """Intenta mover procesos de Nuevo -> Listo/Suspendido si hay cupo"""
+        admitidos = []
+        esperando = [p for p in self.procesos_nuevos if p.tiempo_arribo <= self.tiempo_actual]
+
+        while esperando and self.calcular_grado_multiprogramacion() < self.MAX_MULTIPROGRAMACION:
+            # Elegir el más corto de los que esperan (SRTF desde el inicio)
+            mejor = min(esperando, key=lambda p: p.tiempo_irrupcion)
+            if self.intentar_admitir_proceso(mejor):
+                admitidos.append(mejor)
+                # Las listas se actualizan dentro de intentar_admitir_proceso
+                esperando.remove(mejor)
+            else:
+                break
+        return admitidos
+
+    # --- MOTOR DE SIMULACIÓN ---
+
     def ejecutar_ciclo(self) -> Dict:
         """
-        Ejecuta un ciclo de simulación en el tiempo actual
-        Retorna diccionario con información de cambios para mostrar
+        Avanza un 'tick' lógico del reloj y gestiona todos los eventos.
+        Retorna un resumen de lo ocurrido para mostrarlo al usuario.
         """
-        cambios = {
-            'proceso_terminado': None,
-            'proceso_swapeado': False,
-            'cambio_multiprogramacion': False,
-            'proceso_arribado': False,
-            'hay_cambios': False
-        }
-        
-        # Verificar si el proceso actual terminó (tiempo_restante llegó a 0)
-        # El tiempo_restante ya fue actualizado en ejecutar_simulacion antes de llamar a ejecutar_ciclo
-        if (self.planificador.proceso_actual and 
-            self.planificador.proceso_actual.id != 1 and
-            self.planificador.proceso_actual.tiempo_restante <= 0):
-            proceso_terminado = self.planificador.proceso_actual
-            proceso_terminado.estado = EstadoProceso.TERMINADO
-            # tiempo_finalizacion ya fue establecido en ejecutar_simulacion
-            self.procesos_terminados.append(proceso_terminado)
-            self.gestor_memoria.liberar_memoria(proceso_terminado.id)
+        cambios = {'hay_cambios': False, 'eventos': []}
+
+        # 1. Verificar si el proceso en ejecución terminó
+        proc_actual = self.planificador.proceso_actual
+        if proc_actual and proc_actual.id != "1" and proc_actual.tiempo_restante <= 0:
+            proc_actual.estado = EstadoProceso.TERMINADO
+            if proc_actual.tiempo_finalizacion is None:
+                proc_actual.tiempo_finalizacion = self.tiempo_actual
+            self.procesos_terminados.append(proc_actual)
+            self.gestor_memoria.liberar_memoria(proc_actual.id)
             self.planificador.proceso_actual = None
-            cambios['proceso_terminado'] = proceso_terminado
+
             cambios['hay_cambios'] = True
-            
-            # Intentar admitir procesos: primero suspendidos, luego nuevos
-            if self.intentar_admitir_suspendidos():
-                cambios['hay_cambios'] = True
-            if self.intentar_admitir_procesos_nuevos():
-                cambios['hay_cambios'] = True
-        
-        # Verificar swap SRTF con suspendidos (antes de procesar arribos)
+            cambios['eventos'].append(f"Proceso {proc_actual.id} finalizó su ejecución.")
+
+            # Al liberar RAM, intentamos traer procesos de afuera
+            self.intentar_admitir_suspendidos()
+            self.intentar_admitir_procesos_nuevos()
+
+        # 2. Verificar Swap SRTF (Optimización agresiva - siempre intenta)
         if self.intentar_swap_srtf():
-            cambios['proceso_swapeado'] = True
             cambios['hay_cambios'] = True
-        
-        # Procesar arribos
+            cambios['eventos'].append("Swap SRTF: Proceso suspendido desplazó al actual.")
+
+        # 3. Procesar nuevos arribos (Llegada de procesos)
         if self.procesar_arribos():
-            cambios['proceso_arribado'] = True
             cambios['hay_cambios'] = True
-        
-        # Verificar apropiación SRTF de nuevos procesos
+            cambios['eventos'].append("Nuevos procesos arribaron al sistema.")
+
+        # 4. Planificación de CPU (Seleccionar siguiente)
+        # Si hubo desalojo o terminó el actual, buscar el siguiente
         if self.planificador.proceso_actual:
-            # Verificar si hay un proceso más corto en la cola de listos
+            # Verificar si en la cola de listos hay alguien mejor (Apropiación)
             if self.planificador.cola_listos:
-                proceso_mas_corto_cola = min(self.planificador.cola_listos, key=lambda p: p.tiempo_restante)
-                if proceso_mas_corto_cola.tiempo_restante < self.planificador.proceso_actual.tiempo_restante:
-                    # Apropiación: cambiar procesos
-                    proceso_actual = self.planificador.proceso_actual
-                    proceso_actual.estado = EstadoProceso.LISTO
-                    self.planificador.agregar_proceso_listo(proceso_actual)
-                    
-                    # Remover el más corto de la cola y ponerlo en ejecución
-                    self.planificador.cola_listos.remove(proceso_mas_corto_cola)
-                    # Reconstruir heap
-                    heapq.heapify(self.planificador.cola_listos)
-                    proceso_mas_corto_cola.estado = EstadoProceso.EJECUCION
-                    # Establecer tiempo_inicio si es la primera vez que se ejecuta
-                    if proceso_mas_corto_cola.tiempo_inicio is None:
-                        proceso_mas_corto_cola.tiempo_inicio = self.tiempo_actual
-                    self.planificador.proceso_actual = proceso_mas_corto_cola
-                    cambios['proceso_swapeado'] = True
+                mejor_listo = self.planificador.cola_listos[0] # Mirar tope del heap
+                if mejor_listo.tiempo_restante < self.planificador.proceso_actual.tiempo_restante:
+                    # Context Switch
+                    saliente = self.planificador.proceso_actual
+                    saliente.estado = EstadoProceso.LISTO
+                    self.planificador.agregar_proceso_listo(saliente)
+
+                    entrante = heapq.heappop(self.planificador.cola_listos)
+                    entrante.estado = EstadoProceso.EJECUCION
+                    if entrante.tiempo_inicio is None: entrante.tiempo_inicio = self.tiempo_actual
+                    self.planificador.proceso_actual = entrante
+
                     cambios['hay_cambios'] = True
-        
-        # Si no hay proceso ejecutándose, tomar el siguiente (excluyendo SO)
-        proceso_anterior = self.planificador.proceso_actual.id if self.planificador.proceso_actual else None
-        if not self.planificador.proceso_actual or (self.planificador.proceso_actual and self.planificador.proceso_actual.id == 1):
+                    cambios['eventos'].append(f"Apropiación SRTF: Proceso {entrante.id} desplazó a {saliente.id}")
+
+        # Si CPU libre, tomar el siguiente
+        if not self.planificador.proceso_actual or self.planificador.proceso_actual.id == "1":
             siguiente = self.planificador.obtener_siguiente_proceso()
-            if siguiente and siguiente.id != 1:
+            if siguiente:
                 siguiente.estado = EstadoProceso.EJECUCION
-                # Establecer tiempo_inicio si no está establecido
-                if siguiente.tiempo_inicio is None:
-                    siguiente.tiempo_inicio = self.tiempo_actual
+                if siguiente.tiempo_inicio is None: siguiente.tiempo_inicio = self.tiempo_actual
                 self.planificador.proceso_actual = siguiente
-                if proceso_anterior != siguiente.id:
-                    cambios['hay_cambios'] = True
-        
-        # Verificar cambios en grado de multiprogramación
+                cambios['hay_cambios'] = True
+
+        # Verificar si hubo cambios globales relevantes
         grado_actual = self.calcular_grado_multiprogramacion()
-        if grado_actual != self.estado_previo['grado_multiprogramacion']:
-            cambios['cambio_multiprogramacion'] = True
+        if grado_actual != self.estado_previo.get('grado', -1):
             cambios['hay_cambios'] = True
-        
+
         return cambios
-    
-    def intentar_admitir_suspendidos(self):
-        """
-        Intenta admitir procesos suspendidos cuando hay recursos disponibles
-        Usa SRTF: prioriza el proceso con menor tiempo_restante
-        """
-        procesos_admitidos = []
-        
-        # Ordenar suspendidos por tiempo_restante (SRTF)
-        suspendidos_ordenados = sorted(self.procesos_suspendidos, key=lambda p: p.tiempo_restante)
-        
-        for proceso in suspendidos_ordenados[:]:
-            if self.calcular_grado_multiprogramacion() >= self.max_multiprogramacion:
-                break
-            
-            # Asegurarse de que no esté en procesos_nuevos
-            if proceso in self.procesos_nuevos:
-                self.procesos_nuevos.remove(proceso)
-            
-            if self.admitir_proceso_a_ram(proceso):
-                procesos_admitidos.append(proceso)
-                self.procesos_suspendidos.remove(proceso)
-        
-        return procesos_admitidos
-    
-    def intentar_admitir_procesos_nuevos(self):
-        """
-        Intenta admitir procesos desde la cola de nuevos cuando hay espacio
-        Usa SRTF: busca entre los procesos que ya arribaron el de menor tiempo_irrupcion
-        """
-        procesos_admitidos = []
-        
-        # Buscar procesos que ya arribaron (no los futuros)
-        procesos_esperando = [p for p in self.procesos_nuevos if p.tiempo_arribo <= self.tiempo_actual]
-        
-        # Mientras haya espacio y procesos esperando, usar SRTF
-        while procesos_esperando and self.calcular_grado_multiprogramacion() < self.max_multiprogramacion:
-            # SRTF: seleccionar el proceso con menor tiempo_irrupcion entre los que ya arribaron
-            proceso_srtf = min(procesos_esperando, key=lambda p: p.tiempo_irrupcion)
-            
-            # Intentar admitir
-            if self.intentar_admitir_proceso(proceso_srtf):
-                procesos_admitidos.append(proceso_srtf)
-                self.procesos_nuevos.remove(proceso_srtf)
-                procesos_esperando.remove(proceso_srtf)
-            else:
-                # Si no se pudo admitir (grado lleno o sin memoria), salir del loop
-                break
-        
-        return procesos_admitidos
-    
-    def hay_cambios_significativos(self, cambios: Dict) -> bool:
-        """Determina si hay cambios significativos que justifiquen mostrar el estado"""
-        return True
-    
+
     def calcular_tiempo_proximo_evento(self) -> int:
-        """
-        Calcula el tiempo del próximo evento significativo.
-        Retorna el próximo tiempo donde ocurrirá un cambio de contexto.
-        """
-        tiempos_eventos = []
-        
-        # 1. Próximo arribo de proceso
+        """Calcula saltos de tiempo para no simular tick a tick si no pasa nada"""
+        tiempos = []
+
+        # Próximo arribo
         if self.procesos_nuevos:
-            proximo_arribo = min(p.tiempo_arribo for p in self.procesos_nuevos)
-            if proximo_arribo > self.tiempo_actual:
-                tiempos_eventos.append(proximo_arribo)
-        
-        # 2. Próxima finalización de proceso (si hay uno en ejecución y no es SO)
-        if (self.planificador.proceso_actual and 
-            self.planificador.proceso_actual.id != 1 and
-            self.planificador.proceso_actual.estado == EstadoProceso.EJECUCION and
-            self.planificador.proceso_actual.tiempo_restante > 0):
-            tiempo_finalizacion = self.tiempo_actual + self.planificador.proceso_actual.tiempo_restante
-            tiempos_eventos.append(tiempo_finalizacion)
-        
-        # Si no hay eventos futuros pero hay procesos esperando, retornar tiempo_actual + 1
-        if not tiempos_eventos:
-            # Si hay proceso en ejecución, debería haber un tiempo de finalización
-            # Si no hay, puede ser que no haya procesos o que estén todos suspendidos
-            if (self.planificador.proceso_actual or 
-                self.planificador.cola_listos or 
-                self.procesos_suspendidos):
+            tiempos.append(min(p.tiempo_arribo for p in self.procesos_nuevos))
+
+        # Fin del proceso actual
+        proc = self.planificador.proceso_actual
+        if proc and proc.id != "1" and proc.estado == EstadoProceso.EJECUCION:
+            tiempos.append(self.tiempo_actual + proc.tiempo_restante)
+
+        futuros = [t for t in tiempos if t > self.tiempo_actual]
+        if not futuros:
+            # Si hay actividad, avanzar 1 al menos
+            if proc or self.planificador.cola_listos or self.procesos_suspendidos:
                 return self.tiempo_actual + 1
-            else:
-                return self.tiempo_actual
-        
-        # Retornar el evento más cercano
-        return min(tiempos_eventos)
-    
-    def mostrar_estado_sistema(self, cambios: Dict = None):
-        """Muestra el estado actual del sistema usando tablas tabuladas"""
-        if cambios is None:
-            cambios = {}
-        
-        print(f"\n{'='*70}")
-        print(f"TIEMPO SIMULADO: {self.tiempo_actual}")
-        print(f"{'='*70}")
-        
-        # Estado del procesador
-        estado_procesador = []
-        if self.planificador.proceso_actual:
-            proceso = self.planificador.proceso_actual
-            titulo_display = proceso.titulo if proceso.titulo else f"Proceso {proceso.id}"
-            estado_procesador.append([
-                "Ocupado",
-                f"Proceso {proceso.id} ({titulo_display})",
-                proceso.tiempo_restante,
-                f"Tamaño: {proceso.tamaño}KB"
-            ])
+            return self.tiempo_actual
+
+        return min(futuros)
+
+    # --- VISUALIZACIÓN Y REPORTES ---
+
+    def mostrar_estado_sistema(self, info_cambios: Dict):
+        """Imprime el dashboard principal del simulador con colores"""
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+        print(f"\n{Colores.BOLD}{Colores.BG_AZUL} SIMULADOR DE SO - TIEMPO: {self.tiempo_actual} {Colores.RESET}")
+
+        # 1. Tabla de Procesador
+        proc = self.planificador.proceso_actual
+        if proc:
+            estado_cpu = f"{Colores.VERDE}OCUPADO{Colores.RESET}"
+            detalle = f"{Colores.BOLD}Proceso {proc.id}{Colores.RESET} ({proc.titulo})"
+            restante = f"{proc.tiempo_restante}"
         else:
-            estado_procesador.append(["Libre", "-", "-", "-"])
-        
-        print("\nESTADO DEL PROCESADOR:")
-        print(tabulate(estado_procesador, 
-                      headers=["Estado", "Proceso", "Tiempo Restante", "Info"],
-                      tablefmt="grid"))
-        
-        # Tabla de particiones
-        tabla_particiones = []
-        for particion_info in self.gestor_memoria.obtener_tabla_particiones():
-            if particion_info['proceso_asignado']:
-                proceso_id = "SO" if particion_info['proceso_asignado'] == 1 else str(particion_info['proceso_asignado'])
-                titulo = particion_info['titulo_proceso'] if particion_info['titulo_proceso'] else "-"
-                # Para SO, el título debería ser "Sistema Operativo" si está disponible
-                if particion_info['proceso_asignado'] == 1:
-                    titulo = particion_info['titulo_proceso'] if particion_info['titulo_proceso'] else "Sistema Operativo"
-                tiempo_restante_str = "-" if particion_info['proceso_asignado'] == 1 else str(particion_info['tiempo_restante'])
-            else:
-                proceso_id = "-"
-                titulo = "-"
-                tiempo_restante_str = "-"
-            
-            tabla_particiones.append([
-                particion_info['id'],
-                particion_info['direccion_inicio'],
-                particion_info['tamaño'],
-                proceso_id,
-                titulo,
-                tiempo_restante_str,
-                particion_info['fragmentacion_interna']
-            ])
-        
-        print("\nTABLA DE PARTICIONES:")
-        print(tabulate(tabla_particiones,
-                      headers=["ID Partición", "Dir. Inicio (KB)", "Tamaño (KB)", 
-                              "ID Proceso", "Título", "T. Restante", "Fragmentación (KB)"],
-                      tablefmt="grid"))
-        
-        # Procesos suspendidos
-        tabla_suspendidos = []
+            estado_cpu = f"{Colores.AMARILLO}LIBRE{Colores.RESET}"
+            detalle, restante = "-", "-"
+
+        tabla_cpu = [[estado_cpu, detalle, restante]]
+        print(f"\n{Colores.BOLD}➤ ESTADO DEL PROCESADOR:{Colores.RESET}")
+        print(tabulate(tabla_cpu, headers=["Estado", "Proceso en Ejecución", "Tiempo Restante"], tablefmt="fancy_grid"))
+
+        # 2. Tabla de Memoria
+        print(f"\n{Colores.BOLD}➤ TABLA DE PARTICIONES (Best-Fit):{Colores.RESET}")
+        datos_memoria = self.gestor_memoria.obtener_tabla_particiones()
+        print(tabulate(datos_memoria,
+                      headers=["ID", "Tam. Part.", "Tam. Proc.", "Estado", "Proceso Asignado", "Frag. Interna", "T. Restante"],
+                      tablefmt="fancy_grid"))
+
+        # 3. Colas
+        print(f"\n{Colores.BOLD}➤ COLA DE LISTOS / SUSPENDIDOS:{Colores.RESET}")
+        suspendidos_data = []
         if self.procesos_suspendidos:
-            for proceso in self.procesos_suspendidos:
-                tabla_suspendidos.append([
-                    proceso.id,
-                    proceso.tiempo_restante,
-                    proceso.tamaño
+            for p in self.procesos_suspendidos:
+                suspendidos_data.append([
+                    f"{Colores.ROJO}{p.id}{Colores.RESET}",
+                    p.titulo,
+                    f"{p.tamaño} KB",
+                    p.tiempo_restante
                 ])
+            print(tabulate(suspendidos_data, headers=["ID", "Título", "Tamaño", "T. Restante"], tablefmt="simple"))
         else:
-            tabla_suspendidos.append(["Ninguno", "-", "-"])
-        
-        print(f"\nPROCESOS LISTOS/SUSPENDIDOS ({len(self.procesos_suspendidos)} procesos):")
-        print(tabulate(tabla_suspendidos,
-                      headers=["ID Proceso", "Tiempo Restante", "Tamaño (KB)"],
-                      tablefmt="grid"))
-        
-        # Procesos nuevos en espera (lista simple)
-        # Solo mostrar procesos que NO están en suspendidos (para evitar duplicación)
-        procesos_nuevos_esperando = [p for p in self.procesos_nuevos 
-                                    if p.tiempo_arribo <= self.tiempo_actual 
-                                    and p not in self.procesos_suspendidos]
-        print(f"\nPROCESOS NUEVOS EN ESPERA (Grado máximo alcanzado) ({len(procesos_nuevos_esperando)} procesos):")
-        if procesos_nuevos_esperando:
-            lista_ids = ", ".join([str(p.id) for p in procesos_nuevos_esperando])
-            print(f"  {lista_ids}")
+            print(f"  {Colores.AMARILLO}No hay procesos suspendidos.{Colores.RESET}")
+
+        # 4. Cola de nuevos en espera
+        print(f"\n{Colores.BOLD}➤ COLA DE NUEVOS EN ESPERA:{Colores.RESET}")
+        nuevos_esperando = [p for p in self.procesos_nuevos if p.tiempo_arribo <= self.tiempo_actual]
+        if nuevos_esperando:
+            nuevos_data = []
+            for p in nuevos_esperando:
+                nuevos_data.append([
+                    f"{Colores.AMARILLO}{p.id}{Colores.RESET}",
+                    p.titulo,
+                    f"{p.tamaño} KB",
+                    p.tiempo_irrupcion,
+                    p.tiempo_arribo
+                ])
+            print(tabulate(nuevos_data, headers=["ID", "Título", "Tamaño", "T. Irrupción", "T. Arribo"], tablefmt="simple"))
         else:
-            print("  Ninguno")
-        
-        # Grado de multiprogramación
-        grado_actual = self.calcular_grado_multiprogramacion()
-        # Procesos en RAM excluyendo SO (id 1)
-        procesos_en_ram = len([p for p in self.gestor_memoria.procesos_en_memoria.values() if p.id != 1])
-        procesos_suspendidos = len(self.procesos_suspendidos)
-        print(f"\nGrado de Multiprogramación: {grado_actual}/{self.max_multiprogramacion}")
-        print(f"  - En RAM: {procesos_en_ram}/3")
-        print(f"  - Suspendidos: {procesos_suspendidos}")
-        
-        # Mostrar eventos si hay cambios
-        if cambios:
-            eventos = []
-            if cambios.get('proceso_terminado'):
-                p = cambios['proceso_terminado']
-                titulo_display = f" ({p.titulo})" if p.titulo else ""
-                eventos.append(f"✓ Proceso {p.id}{titulo_display} terminado")
-            if cambios.get('proceso_swapeado'):
-                eventos.append("↔ Intercambio SRTF realizado")
-            
-            if eventos:
-                print("\nEVENTOS EN ESTE CICLO:")
-                for evento in eventos:
-                    print(f"  {evento}")
-    
+            print(f"  {Colores.AMARILLO}No hay procesos nuevos esperando.{Colores.RESET}")
+
+        # 5. Info General
+        grado = self.calcular_grado_multiprogramacion()
+        print(f"\n{Colores.CIAN}ℹ Grado de Multiprogramación: {grado}/{self.MAX_MULTIPROGRAMACION}{Colores.RESET}")
+
+        # 7. Eventos recientes
+        if info_cambios.get('eventos'):
+            print(f"\n{Colores.BOLD}🔔 EVENTOS DEL CICLO:{Colores.RESET}")
+            for ev in info_cambios['eventos']:
+                print(f"  • {ev}")
+
     def calcular_estadisticas(self):
-        """Calcula y muestra estadísticas finales"""
+        """Genera el informe final de rendimiento"""
         if not self.procesos_terminados:
-            print("\nNo hay procesos terminados para calcular estadísticas.")
+            print("No hay estadísticas para mostrar.")
             return
-        
-        print(f"\n{'='*80}")
-        print("INFORME ESTADÍSTICO FINAL")
-        print(f"{'='*80}")
-        
-        tiempos_retorno = []
-        tiempos_espera = []
-        
-        tabla_estadisticas = []
-        for proceso in sorted(self.procesos_terminados, key=lambda p: p.id):
-            tiempo_retorno = proceso.tiempo_finalizacion - proceso.tiempo_arribo
-            tiempo_espera = proceso.tiempo_inicio - proceso.tiempo_arribo
-            
-            tiempos_retorno.append(tiempo_retorno)
-            tiempos_espera.append(tiempo_espera)
-            
-            # Mostrar ID y título si existe
-            proceso_display = f"{proceso.id} ({proceso.titulo})" if proceso.titulo else str(proceso.id)
-            
-            tabla_estadisticas.append([
-                proceso_display,
-                proceso.tiempo_arribo,
-                proceso.tiempo_inicio,
-                proceso.tiempo_finalizacion,
-                tiempo_retorno,
-                tiempo_espera
+
+        print(f"\n{Colores.BOLD}{Colores.BG_VERDE} === INFORME ESTADÍSTICO FINAL === {Colores.RESET}\n")
+
+        tabla_stats = []
+        t_retorno_total = 0
+        t_espera_total = 0
+
+        for p in sorted(self.procesos_terminados, key=lambda x: str(x.id)):
+            t_retorno = p.tiempo_finalizacion - p.tiempo_arribo
+            t_espera = p.tiempo_inicio - p.tiempo_arribo
+
+            t_retorno_total += t_retorno
+            t_espera_total += t_espera
+
+            tabla_stats.append([
+                f"P{p.id}",
+                p.tiempo_arribo,
+                p.tiempo_inicio,
+                p.tiempo_finalizacion,
+                t_retorno,
+                t_espera
             ])
-        
+
         # Promedios
-        tiempo_retorno_promedio = sum(tiempos_retorno) / len(tiempos_retorno)
-        tiempo_espera_promedio = sum(tiempos_espera) / len(tiempos_espera)
-        
-        tabla_estadisticas.append([
-            "PROMEDIO",
-            "-",
-            "-",
-            "-",
-            f"{tiempo_retorno_promedio:.2f}",
-            f"{tiempo_espera_promedio:.2f}"
-        ])
-        
-        print("\nESTADÍSTICAS POR PROCESO:")
-        print(tabulate(tabla_estadisticas,
-                      headers=["Proceso", "T. Arribo", "T. Inicio", "T. Fin", 
-                              "T. Retorno", "T. Espera"],
-                      tablefmt="grid"))
-        
-        # Rendimiento del sistema
-        tiempo_total = self.tiempo_actual
-        rendimiento = len(self.procesos_terminados) / tiempo_total if tiempo_total > 0 else 0
-        
-        print(f"\nRESUMEN GENERAL:")
-        resumen = [
-            ["Procesos terminados", len(self.procesos_terminados)],
-            ["Tiempo de retorno promedio", f"{tiempo_retorno_promedio:.2f}"],
-            ["Tiempo de espera promedio", f"{tiempo_espera_promedio:.2f}"],
-            ["Rendimiento del sistema", f"{rendimiento:.4f} procesos/unidad_tiempo"],
-            ["Tiempo total de simulación", tiempo_total],
-            ["Procesos suspendidos al finalizar", len(self.procesos_suspendidos)],
-            ["Procesos nuevos pendientes", len(self.procesos_nuevos)]
-        ]
-        print(tabulate(resumen, headers=["Métrica", "Valor"], tablefmt="grid"))
-    
-    def ejecutar_simulacion(self, mostrar_pasos: bool = True):
-        """
-        Ejecuta la simulación completa
-        Cada iteración avanza una unidad de tiempo simulada
-        """
-        print("Iniciando simulación del Sistema Operativo...")
-        print(f"Procesos cargados: {len(self.procesos_nuevos)}")
-        
-        # Actualizar estado previo inicial
-        self.estado_previo['grado_multiprogramacion'] = self.calcular_grado_multiprogramacion()
-        self.estado_previo['cola_listos_len'] = len(self.planificador.cola_listos)
-        self.estado_previo['cola_suspendidos_len'] = len(self.procesos_suspendidos)
-        self.estado_previo['proceso_ejecutando'] = self.planificador.proceso_actual.id if self.planificador.proceso_actual else None
-        
-        # Mostrar estado inicial
-        if mostrar_pasos:
-            self.mostrar_estado_sistema({'hay_cambios': True})
-            input("\nPresiona Enter para avanzar al próximo cambio de contexto...")
-        
-        # Continuar mientras haya procesos por procesar o ejecutar
-        while (self.procesos_nuevos or 
-               self.planificador.cola_listos or 
-               (self.planificador.proceso_actual and self.planificador.proceso_actual.id != 1) or
+        n = len(self.procesos_terminados)
+        prom_retorno = t_retorno_total / n
+        prom_espera = t_espera_total / n
+
+        tabla_stats.append(["PROM", "-", "-", "-", f"{prom_retorno:.2f}", f"{prom_espera:.2f}"])
+
+        print(tabulate(tabla_stats,
+                      headers=["Proceso", "Arribo", "Inicio", "Fin", "T. Retorno", "T. Espera"],
+                      tablefmt="github"))
+
+        rendimiento = n / self.tiempo_actual if self.tiempo_actual > 0 else 0
+        print(f"\n{Colores.BOLD}Rendimiento del Sistema:{Colores.RESET} {rendimiento:.4f} procesos/unidad de tiempo")
+
+    def ejecutar_simulacion(self, paso_a_paso: bool = True):
+        """Bucle principal de la simulación"""
+        print(f"{Colores.VERDE}Iniciando simulación...{Colores.RESET}")
+        self.mostrar_estado_sistema({'hay_cambios': True})
+        if paso_a_paso: input("Presiona Enter para comenzar...")
+
+        self.estado_previo['grado'] = self.calcular_grado_multiprogramacion()
+
+        while (self.procesos_nuevos or self.planificador.cola_listos or
+               (self.planificador.proceso_actual and self.planificador.proceso_actual.id != "1") or
                self.procesos_suspendidos):
-            
-            # Calcular próximo evento
-            tiempo_proximo_evento = self.calcular_tiempo_proximo_evento()
-            
-            # Si el próximo evento es en el futuro, avanzar el tiempo y actualizar tiempo_restante
-            if tiempo_proximo_evento > self.tiempo_actual:
-                tiempo_delta = tiempo_proximo_evento - self.tiempo_actual
-                
-                # Si hay un proceso ejecutándose (y no es SO), actualizar su tiempo_restante
-                if (self.planificador.proceso_actual and 
-                    self.planificador.proceso_actual.id != 1 and
-                    self.planificador.proceso_actual.estado == EstadoProceso.EJECUCION):
-                    # Actualizar tiempo_restante directamente
-                    proceso = self.planificador.proceso_actual
-                    tiempo_a_restar = min(tiempo_delta, proceso.tiempo_restante)
-                    proceso.tiempo_restante -= tiempo_a_restar
-                    
-                    # Si el proceso tiene tiempo_inicio None, inicializarlo
-                    if proceso.tiempo_inicio is None:
-                        proceso.tiempo_inicio = self.tiempo_actual
-                    
-                    # Si el proceso terminó (tiempo_restante llegó a 0)
-                    if proceso.tiempo_restante <= 0:
-                        proceso.tiempo_restante = 0
-                        proceso.tiempo_finalizacion = tiempo_proximo_evento
-                        # El proceso se marcará como terminado en ejecutar_ciclo
-                
-                # Avanzar tiempo al evento
-                self.tiempo_actual = tiempo_proximo_evento
-            elif tiempo_proximo_evento == self.tiempo_actual:
-                # El evento es en el tiempo actual, no necesitamos avanzar tiempo
-                # pero sí necesitamos verificar si hay un proceso ejecutándose que necesita tiempo_inicio
-                if (self.planificador.proceso_actual and 
-                    self.planificador.proceso_actual.id != 1 and
-                    self.planificador.proceso_actual.estado == EstadoProceso.EJECUCION and
-                    self.planificador.proceso_actual.tiempo_inicio is None):
-                    self.planificador.proceso_actual.tiempo_inicio = self.tiempo_actual
-            
-            # Ejecutar ciclo en el tiempo del evento (procesar arribos, cambios, etc.)
+
+            # Avanzar tiempo inteligentemente
+            prox_evento = self.calcular_tiempo_proximo_evento()
+
+            if prox_evento > self.tiempo_actual:
+                delta = prox_evento - self.tiempo_actual
+
+                # Actualizar proceso en ejecución durante el salto
+                proc = self.planificador.proceso_actual
+                if proc and proc.id != "1" and proc.estado == EstadoProceso.EJECUCION:
+                    descuento = min(delta, proc.tiempo_restante)
+                    proc.tiempo_restante -= descuento
+                    if proc.tiempo_inicio is None: proc.tiempo_inicio = self.tiempo_actual
+
+                self.tiempo_actual = prox_evento
+
+            # Ejecutar lógica del ciclo
             cambios = self.ejecutar_ciclo()
-            
-            # Mostrar estado solo si hay cambios significativos
-            if mostrar_pasos:
-                if cambios.get('hay_cambios', False):
-                    self.mostrar_estado_sistema(cambios)
-                    input("\nPresiona Enter para avanzar al próximo cambio de contexto...")
-                elif not (self.procesos_nuevos or 
-                         self.planificador.cola_listos or 
-                         (self.planificador.proceso_actual and self.planificador.proceso_actual.id != 1) or
-                         self.procesos_suspendidos):
-                    # Si no hay más procesos, terminar
-                    break
-            
-            # Actualizar estado previo para detectar cambios
-            self.estado_previo['grado_multiprogramacion'] = self.calcular_grado_multiprogramacion()
-            self.estado_previo['cola_listos_len'] = len(self.planificador.cola_listos)
-            self.estado_previo['cola_suspendidos_len'] = len(self.procesos_suspendidos)
-            self.estado_previo['proceso_ejecutando'] = self.planificador.proceso_actual.id if self.planificador.proceso_actual else None
-            
-            # Límite de seguridad para evitar bucles infinitos
-            if self.tiempo_actual > 1000:
-                print("Simulación detenida por límite de tiempo")
+
+            if paso_a_paso and cambios['hay_cambios']:
+                self.mostrar_estado_sistema(cambios)
+                input(f"\n{Colores.RESET}{Colores.ITALIC}Presiona Enter para continuar...{Colores.RESET}")
+
+            # Actualizar estado previo
+            self.estado_previo['grado'] = self.calcular_grado_multiprogramacion()
+
+            if self.tiempo_actual > 2000: # Safety break
+                print("Límite de tiempo excedido.")
                 break
-        
-        print(f"\nSimulación completada en tiempo: {self.tiempo_actual}")
+
+        print(f"\n{Colores.BOLD}Simulación finalizada en T={self.tiempo_actual}{Colores.RESET}")
         self.calcular_estadisticas()
 
+    # --- CARGA DE DATOS ---
+    def cargar_procesos_desde_archivo(self, ruta: str) -> bool:
+        if not os.path.exists(ruta): return False
+        try:
+            with open(ruta, 'r') as f:
+                for linea in f:
+                    parts = linea.strip().split(',')
+                    if len(parts) < 4 or linea.startswith('#'): continue
+
+                    # Ahora se acepta el ID tal cual viene del archivo (string)
+                    pid = parts[0].strip()
+                    if pid == "1": continue # Reservado SO
+
+                    p = Proceso(
+                        id=pid,
+                        tamaño=int(parts[1]),
+                        tiempo_arribo=int(parts[2]),
+                        tiempo_irrupcion=int(parts[3]),
+                        titulo=f"Proceso {pid}"
+                    )
+                    self.procesos_nuevos.append(p)
+            self.procesos_nuevos.sort(key=lambda x: x.tiempo_arribo)
+            return True
+        except Exception as e:
+            print(f"Error cargando archivo: {e}")
+            return False
+
+    def cargar_procesos_manual(self) -> bool:
+        """Permite al usuario ingresar procesos uno a uno desde la consola"""
+        print(f"\n{Colores.BOLD}=== CARGA MANUAL DE PROCESOS ==={Colores.RESET}")
+        print("Ingrese los datos. Escriba 'FIN' en el ID para terminar.")
+
+        i = 1
+        while True:
+            print(f"\n{Colores.CIAN}--- Proceso #{i} ---{Colores.RESET}")
+            pid = input("ID del Proceso (ej: P1): ").strip()
+
+            if pid.upper() == 'FIN':
+                break
+
+            if not pid:
+                print(f"{Colores.ROJO}El ID no puede estar vacío.{Colores.RESET}")
+                continue
+
+            if pid == "1":
+                print(f"{Colores.ROJO}El ID '1' está reservado para el Sistema Operativo.{Colores.RESET}")
+                continue
+
+            # Verificar duplicados
+            if any(p.id == pid for p in self.procesos_nuevos):
+                print(f"{Colores.ROJO}Ya existe un proceso con ID {pid}.{Colores.RESET}")
+                continue
+
+            try:
+                tam = int(input("Tamaño (KB): "))
+                arr = int(input("Tiempo de Arribo: "))
+                irr = int(input("Tiempo de Irrupción: "))
+
+                if tam <= 0 or arr < 0 or irr <= 0:
+                    print(f"{Colores.ROJO}Valores inválidos. Tamaño/Irrupción > 0, Arribo >= 0.{Colores.RESET}")
+                    continue
+
+                p = Proceso(
+                    id=pid,
+                    tamaño=tam,
+                    tiempo_arribo=arr,
+                    tiempo_irrupcion=irr,
+                    titulo=f"Proceso {pid}"
+                )
+                self.procesos_nuevos.append(p)
+                print(f"{Colores.VERDE}Proceso agregado correctamente.{Colores.RESET}")
+                i += 1
+
+            except ValueError:
+                print(f"{Colores.ROJO}Error: Debe ingresar números enteros válidos para Tamaño, Arribo e Irrupción.{Colores.RESET}")
+
+        if self.procesos_nuevos:
+            self.procesos_nuevos.sort(key=lambda x: x.tiempo_arribo)
+            return True
+        return False
+
 def main():
-    """Función principal del simulador"""
-    simulador = SimuladorSO()
-    
-    print("=== SIMULADOR DE ASIGNACIÓN DE MEMORIA Y PLANIFICACIÓN DE PROCESOS ===")
-    print("Configuración:")
-    print("- Particiones fijas: 100K (SO), 250K (grandes), 150K (medianos), 50K (pequeños)")
-    print("- Algoritmo de asignación: Best-Fit")
-    print("- Algoritmo de planificación: SRTF (Shortest Remaining Time First)")
-    print("- Grado máximo de multiprogramación: 5\n")
-    
-    # Elegir método de carga
+    sim = SimuladorSO()
+    print(f"{Colores.BOLD}{Colores.CIAN}=== SIMULADOR DE MEMORIA Y PROCESOS ==={Colores.RESET}")
+    print("Config: Particiones Fijas + Best-Fit + SRTF")
+
     while True:
-        metodo = input("¿Cómo desea cargar los procesos?\n  1. Desde archivo\n  2. Manualmente por consola\nSeleccione (1 o 2): ").strip()
-        
-        if metodo == "1":
-            nombre_archivo = input("\nIngrese el nombre del archivo de procesos (ejemplo: procesos.txt): ").strip()
-            if simulador.cargar_procesos_desde_archivo(nombre_archivo):
+        print(f"\n{Colores.BOLD}Seleccione el método de carga:{Colores.RESET}")
+        print("1. Cargar desde archivo")
+        print("2. Cargar manualmente")
+        opcion = input("Opción (1/2): ").strip()
+
+        if opcion == "1":
+            archivo = input("Ingrese nombre del archivo (ej: archivo.txt): ").strip()
+            if sim.cargar_procesos_desde_archivo(archivo):
                 break
             else:
-                print("No se pudieron cargar los procesos desde el archivo.")
-                reintentar = input("¿Desea intentar cargar manualmente? (s/n): ").lower().startswith('s')
-                if reintentar:
-                    metodo = "2"
-                    break
-                else:
-                    print("Finalizando simulación.")
-                    return
-        elif metodo == "2":
-            if simulador.cargar_procesos_manual():
+                print(f"{Colores.ROJO}No se pudo cargar el archivo.{Colores.RESET}")
+        elif opcion == "2":
+            if sim.cargar_procesos_manual():
                 break
             else:
-                print("No se cargaron procesos. Finalizando simulación.")
+                print(f"{Colores.AMARILLO}No se cargaron procesos.{Colores.RESET}")
                 return
         else:
-            print("❌ Opción inválida. Por favor seleccione 1 o 2.")
-    
-    # Opciones de visualización
-    mostrar_pasos = input("\n¿Mostrar paso a paso? (s/n): ").lower().startswith('s')
-    
-    # Ejecutar simulación
-    simulador.ejecutar_simulacion(mostrar_pasos)
+            print(f"{Colores.ROJO}Opción inválida.{Colores.RESET}")
+
+    sim.ejecutar_simulacion(paso_a_paso=True)
 
 if __name__ == "__main__":
+    # Truco para habilitar colores ANSI en Windows antiguos
+    os.system("")
     main()

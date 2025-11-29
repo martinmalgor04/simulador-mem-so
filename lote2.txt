@@ -3,12 +3,13 @@
 # Nota: El título es opcional. Si no se proporciona, se usará "Proceso {ID}"
 # El ID=1 está reservado para el Sistema Operativo
 
-2,180,1,15,Editor de Texto
-3,60,2,4,Navegador Web
-4,200,3,10,Compilador
-5,30,4,3,Calculadora
-6,120,5,7,Editor de Imágenes
-7,45,6,5,Reproductor de Música
-8,160,7,9,Base de Datos
-9,25,8,2,Terminal
-10,90,9,6,Correo Electrónico
+P1,50,0,30
+P2,150,0,8
+P3,250,0,25
+P4,200,1,20
+P5,210,2,15
+P6,45,3,4
+P7,120,4,9
+P8,60,5,7
+P9,130,6,6
+P10,140,7,10
