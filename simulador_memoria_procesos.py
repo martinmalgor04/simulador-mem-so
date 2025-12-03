@@ -138,7 +138,7 @@ class GestorMemoria:
         self.particiones[0].proceso_asignado = "1"
         self.procesos_en_memoria["1"] = proceso_so
 
-    def asignar_memoria(self, proceso: Proceso) -> bool:
+    def algoritmo_bestfit(self, proceso: Proceso) -> bool:
         """
         Intenta asignar memoria a un proceso usando el algoritmo **Best-Fit**.
 
@@ -316,7 +316,7 @@ class SimuladorSO:
         """Intenta pasar un proceso a estado LISTO (asignándole RAM)."""
         if proceso.id == "1": return False
 
-        if not self.gestor_memoria.asignar_memoria(proceso):
+        if not self.gestor_memoria.algoritmo_bestfit(proceso):
             return False
 
         # Verificar si este proceso debe expropiar al actual (SRTF)
@@ -378,7 +378,7 @@ class SimuladorSO:
         self.procesos_suspendidos.append(proc_saliente)
 
         # 2. Meter a RAM al candidato (Best-Fit encontrará hueco ahora)
-        if self.gestor_memoria.asignar_memoria(candidato):
+        if self.gestor_memoria.algoritmo_bestfit(candidato):
             self.procesos_suspendidos.remove(candidato)
             candidato.estado = EstadoProceso.EJECUCION
             if candidato.tiempo_inicio is None:
@@ -388,7 +388,7 @@ class SimuladorSO:
         else:
             # Rollback si falla la asignación (muy raro si acabamos de liberar)
             self.procesos_suspendidos.remove(proc_saliente)
-            self.gestor_memoria.asignar_memoria(proc_saliente)
+            self.gestor_memoria.algoritmo_bestfit(proc_saliente)
             self.planificador.proceso_actual = proc_saliente
             proc_saliente.estado = EstadoProceso.EJECUCION
             return False
@@ -458,6 +458,11 @@ class SimuladorSO:
         """
         cambios = {'hay_cambios': False, 'eventos': []}
 
+        # 0. Procesar nuevos arribos (Llegada de procesos) - PRIMERO para que entren en consideración
+        if self.procesar_arribos():
+            cambios['hay_cambios'] = True
+            cambios['eventos'].append("Nuevos procesos arribaron al sistema.")
+
         # 1. Verificar si el proceso en ejecución terminó
         proc_actual = self.planificador.proceso_actual
         if proc_actual and proc_actual.id != "1" and proc_actual.tiempo_restante <= 0:
@@ -480,10 +485,7 @@ class SimuladorSO:
             cambios['hay_cambios'] = True
             cambios['eventos'].append("Swap SRTF: Proceso suspendido desplazó al actual.")
 
-        # 3. Procesar nuevos arribos (Llegada de procesos)
-        if self.procesar_arribos():
-            cambios['hay_cambios'] = True
-            cambios['eventos'].append("Nuevos procesos arribaron al sistema.")
+
 
         # 4. Planificación de CPU (Seleccionar siguiente)
         # Si hubo desalojo o terminó el actual, buscar el siguiente
@@ -510,9 +512,15 @@ class SimuladorSO:
             siguiente = self.planificador.obtener_siguiente_proceso()
             if siguiente:
                 siguiente.estado = EstadoProceso.EJECUCION
-                if siguiente.tiempo_inicio is None: siguiente.tiempo_inicio = self.tiempo_actual
+                if siguiente.tiempo_inicio is None:
+                    siguiente.tiempo_inicio = self.tiempo_actual
                 self.planificador.proceso_actual = siguiente
                 cambios['hay_cambios'] = True
+                
+                # Check for immediate swap if a suspended process is better
+                if self.intentar_swap_srtf():
+                    cambios['hay_cambios'] = True
+                    cambios['eventos'].append("Swap SRTF inmediato: Proceso suspendido desplazó al nuevo actual.")
 
         # Verificar si hubo cambios globales relevantes
         grado_actual = self.calcular_grado_multiprogramacion()
