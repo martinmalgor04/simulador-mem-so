@@ -707,6 +707,7 @@ class SimuladorSO:
 
         print(f"\n{Colores.BOLD}Simulación finalizada en T={self.tiempo_actual}{Colores.RESET}")
         self.calcular_estadisticas()
+        input(f"\n{Colores.BOLD}Presiona Enter para cerrar el simulador...{Colores.RESET}")
 
     # --- CARGA DE DATOS ---
     def cargar_procesos_desde_archivo(self, ruta: str) -> bool:
@@ -818,6 +819,6 @@ def main():
     sim.ejecutar_simulacion(paso_a_paso=True)
 
 if __name__ == "__main__":
-    # Truco para habilitar colores ANSI en Windows antiguos
     os.system("")
     main()
+    
