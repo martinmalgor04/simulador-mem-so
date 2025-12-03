@@ -494,7 +494,7 @@ class SimuladorSO:
             if self.planificador.cola_listos:
                 mejor_listo = self.planificador.cola_listos[0] # Mirar tope del heap
                 if mejor_listo.tiempo_restante < self.planificador.proceso_actual.tiempo_restante:
-                    # Context Switch
+                    # Cambio de Contexto
                     saliente = self.planificador.proceso_actual
                     saliente.estado = EstadoProceso.LISTO
                     self.planificador.agregar_proceso_listo(saliente)
@@ -517,7 +517,7 @@ class SimuladorSO:
                 self.planificador.proceso_actual = siguiente
                 cambios['hay_cambios'] = True
                 
-                # Check for immediate swap if a suspended process is better
+                # Chequea por un swap inmediato si un proceso suspendido es mejor
                 if self.intentar_swap_srtf():
                     cambios['hay_cambios'] = True
                     cambios['eventos'].append("Swap SRTF inmediato: Proceso suspendido desplazó al nuevo actual.")
@@ -701,7 +701,7 @@ class SimuladorSO:
             # Actualizar estado previo
             self.estado_previo['grado'] = self.calcular_grado_multiprogramacion()
 
-            if self.tiempo_actual > 2000: # Safety break
+            if self.tiempo_actual > 2000: # Freno de seguridad
                 print("Límite de tiempo excedido.")
                 break
 
