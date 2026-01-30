@@ -73,6 +73,7 @@ class Proceso:
     tiempo_restante: int = None      # Tiempo de CPU que le falta para terminar
     tiempo_inicio: int = None        # Momento en que entra a ejecución por primera vez
     tiempo_finalizacion: int = None  # Momento en que termina su ejecución
+    tiempo_arribo_listos: int = None # Momento en que entra a la cola de listos (RAM o Suspendido)
     estado: EstadoProceso = EstadoProceso.NUEVO
     particion_asignada: int = None   # ID de la partición de memoria asignada
 
@@ -331,29 +332,43 @@ class SimuladorSO:
         self.planificador.agregar_proceso_listo(proceso)
         return True
 
-    def intentar_admitir_proceso(self, proceso: Proceso) -> bool:
+    def intentar_admitir_proceso(self, proceso: Proceso) -> Tuple[bool, Optional[str]]:
         """
         Gestiona la admisión de un proceso nuevo al sistema.
         Decide si va a RAM (Listo) o a Disco (Suspendido) según disponibilidad.
+        
+        Retorna: (éxito, mensaje_opcional) donde mensaje es un evento a mostrar al usuario.
         """
         # Limpieza previa
         if proceso in self.procesos_nuevos: self.procesos_nuevos.remove(proceso)
         if proceso in self.procesos_suspendidos: self.procesos_suspendidos.remove(proceso)
 
+        # 0. Validar tamaño máximo de partición (250KB) - RECHAZAR SI ES MUY GRANDE
+        max_particion = 250
+        if proceso.tamaño > max_particion:
+            msg = f"{Colores.ROJO}⛔ RECHAZADO{Colores.RESET} Proceso {proceso.id}: Tamaño {proceso.tamaño}KB excede partición máxima ({max_particion}KB)"
+            # No se agrega a ninguna cola, efectivamente descartado del sistema
+            return (False, msg)
+
         # Verificar límite global de multiprogramación
         if self.calcular_grado_multiprogramacion() >= self.MAX_MULTIPROGRAMACION:
             self.agregar_a_cola_nuevos(proceso)
-            return False
+            return (False, None)
 
         # Intento 1: Asignar directamente a RAM
         if self.admitir_proceso_a_ram(proceso):
-            return True
+            if proceso.tiempo_arribo_listos is None:
+                proceso.tiempo_arribo_listos = self.tiempo_actual
+            return (True, None)
 
         # Intento 2: Si no hay RAM pero hay cupo de multiprogramación -> Suspendido
         proceso.estado = EstadoProceso.LISTO_SUSPENDIDO
+        if proceso.tiempo_arribo_listos is None:
+            proceso.tiempo_arribo_listos = self.tiempo_actual
+            
         if proceso not in self.procesos_suspendidos:
             self.procesos_suspendidos.append(proceso)
-        return False
+        return (False, None)
 
     def intentar_swap_srtf(self) -> bool:
         """
@@ -408,15 +423,18 @@ class SimuladorSO:
             return mejor_suspendido
         return None # No vale la pena hacer swap
 
-    def procesar_arribos(self) -> bool:
-        """Verifica procesos que llegan en t = tiempo_actual"""
-        arribados = []
+    def procesar_arribos(self) -> List[str]:
+        """Verifica procesos que llegan en t = tiempo_actual.
+        Retorna: Lista de mensajes de eventos (rechazos, arribos, etc.)
+        """
+        mensajes = []
         for p in self.procesos_nuevos[:]:
             if p.tiempo_arribo <= self.tiempo_actual:
                 self.procesos_nuevos.remove(p)
-                arribados.append(p)
-                self.intentar_admitir_proceso(p)
-        return len(arribados) > 0
+                exito, msg = self.intentar_admitir_proceso(p)
+                if msg:
+                    mensajes.append(msg)
+        return mensajes
 
     def intentar_admitir_suspendidos(self) -> List[Proceso]:
         """Intenta mover procesos de Suspendido -> Listo cuando se libera RAM"""
@@ -441,7 +459,8 @@ class SimuladorSO:
         while esperando and self.calcular_grado_multiprogramacion() < self.MAX_MULTIPROGRAMACION:
             # Elegir el más corto de los que esperan (SRTF desde el inicio)
             mejor = min(esperando, key=lambda p: p.tiempo_irrupcion)
-            if self.intentar_admitir_proceso(mejor):
+            exito, msg = self.intentar_admitir_proceso(mejor)
+            if exito:
                 admitidos.append(mejor)
                 # Las listas se actualizan dentro de intentar_admitir_proceso
                 esperando.remove(mejor)
@@ -459,9 +478,10 @@ class SimuladorSO:
         cambios = {'hay_cambios': False, 'eventos': []}
 
         # 0. Procesar nuevos arribos (Llegada de procesos) - PRIMERO para que entren en consideración
-        if self.procesar_arribos():
+        mensajes_arribo = self.procesar_arribos()
+        if mensajes_arribo:
             cambios['hay_cambios'] = True
-            cambios['eventos'].append("Nuevos procesos arribaron al sistema.")
+            cambios['eventos'].extend(mensajes_arribo)
 
         # 1. Verificar si el proceso en ejecución terminó
         proc_actual = self.planificador.proceso_actual
@@ -635,15 +655,18 @@ class SimuladorSO:
         t_espera_total = 0
 
         for p in sorted(self.procesos_terminados, key=lambda x: str(x.id)):
-            t_retorno = p.tiempo_finalizacion - p.tiempo_arribo
-            t_espera = p.tiempo_inicio - p.tiempo_arribo
+            # CORRECCIÓN: Referencia Arribo a Cola de Listos (No Memoria/Sistema)
+            ref_arribo = p.tiempo_arribo_listos if p.tiempo_arribo_listos is not None else p.tiempo_arribo
+
+            t_retorno = p.tiempo_finalizacion - ref_arribo
+            t_espera = t_retorno - p.tiempo_irrupcion # Wait = Turnaround - Burst
 
             t_retorno_total += t_retorno
             t_espera_total += t_espera
 
             tabla_stats.append([
                 f"P{p.id}",
-                p.tiempo_arribo,
+                ref_arribo,
                 p.tiempo_inicio,
                 p.tiempo_finalizacion,
                 t_retorno,
@@ -658,7 +681,7 @@ class SimuladorSO:
         tabla_stats.append(["PROM", "-", "-", "-", f"{prom_retorno:.2f}", f"{prom_espera:.2f}"])
 
         print(tabulate(tabla_stats,
-                      headers=["Proceso", "Arribo", "Inicio", "Fin", "T. Retorno", "T. Espera"],
+                      headers=["Proceso", "Arribo (Listos)", "Inicio", "Fin", "T. Retorno", "T. Espera"],
                       tablefmt="github"))
 
         rendimiento = n / self.tiempo_actual if self.tiempo_actual > 0 else 0
